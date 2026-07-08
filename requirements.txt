@@ -1,0 +1,26 @@
+# Core
+mcp>=1.2.0
+chromadb>=0.5.0
+
+# Answer generation (Gemini backend — the default LLM answerer)
+google-genai>=1.0.0
+
+# Web UI
+fastapi>=0.110.0
+uvicorn>=0.29.0
+
+# Optional: local LLM answers via Ollama use `requests` (already a chromadb dep).
+# Optional: hosted embeddings -> pip install voyageai
+
+# Embeddings (local, default) — swap to voyageai if you prefer hosted
+sentence-transformers>=3.0.0
+
+# Optional hosted embeddings (uncomment if you set EMBEDDING_PROVIDER=voyage)
+# voyageai>=0.3.0
+
+# Document parsing
+pypdf>=5.0.0
+python-docx>=1.1.0
+python-pptx>=1.0.0
+pypdfium2>=4.0.0          # renders scanned-PDF pages for Gemini OCR
+python-dotenv>=1.0.0

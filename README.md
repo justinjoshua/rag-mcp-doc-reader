@@ -1,0 +1,203 @@
+# RAG + MCP Document Query Reader
+
+Ask questions over your own documents (PDF / Markdown / text / DOCX). Retrieval
+is powered by local embeddings + a ChromaDB vector store; answers are generated
+by **Google Gemini**, grounded in the retrieved passages. The corpus is also
+exposed as an **MCP server** so any MCP client can query it.
+
+```
+docs/ ──► ingest ──► chunk ──► embed (local) ──► ChromaDB
+                                                     │
+   ask.py / web UI ──► retrieve ──► Gemini ──► grounded answer   ← primary
+   MCP client ──────► search_documents ┘                        ← optional
+```
+
+**Answer backends** (set `ANSWER_BACKEND` in `.env`):
+
+| Backend | Needs | Notes |
+|---------|-------|-------|
+| `gemini` | `GEMINI_API_KEY` | Google Gemini API — the default answerer |
+| `extractive` | nothing | No LLM: returns the ranked passages. Works fully offline |
+| `ollama` | local [Ollama](https://ollama.com) | Free, offline LLM answers |
+
+Retrieval, chunking, storage, and the MCP server are the same regardless of
+backend — only the final "write the answer" step changes.
+
+## Setup
+
+```bash
+cd rag-mcp-doc-reader
+python -m venv .venv
+# Windows:  .venv\Scripts\activate
+# macOS/Linux:  source .venv/bin/activate
+pip install -r requirements.txt
+
+cp .env.example .env          # then edit .env
+```
+
+The first ingest downloads the local embedding model (`all-MiniLM-L6-v2`, ~90 MB)
+once; after that it runs fully offline.
+
+## Ingest your documents
+
+Drop files into `docs/` (subfolders are fine), then:
+
+```bash
+python -m docreader.ingest --reset      # build the index from scratch
+python -m docreader.ingest              # add new files later (idempotent)
+```
+
+Supported: `.pdf`, `.docx`, `.pptx`, `.md`, `.txt`, `.rst`, `.csv`, `.json`.
+Re-running without `--reset` upserts by content hash, so unchanged chunks aren't
+duplicated.
+
+**Scanned / image PDFs:** if a PDF has no text layer, the reader automatically
+OCRs it — it renders each page and has Gemini transcribe the text (needs a
+Gemini key; controlled by `OCR` / `OCR_MAX_PAGES`). Slower and uses some API
+quota, but makes scanned lecture slides / documents searchable.
+
+## Get a Gemini API key
+
+The default `gemini` backend needs a key: **https://aistudio.google.com/apikey**
+(format: `AIza...`). Put it in `.env`:
+
+```
+ANSWER_BACKEND=gemini
+GEMINI_API_KEY=AIza...your-key...
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+No key yet? Set `ANSWER_BACKEND=extractive` to use the reader in retrieval-only
+mode (returns ranked passages, no LLM) until you have one.
+
+## Query — option A: standalone CLI
+
+```bash
+python -m docreader.ask "What does the report say about Q3 revenue?"
+```
+
+Prints the answer followed by the source passages it was grounded in.
+
+## Query — option B: web UI
+
+A self-contained chat front-end (single page, no build step, no external CDN):
+
+```bash
+python -m docreader.web        # serves http://127.0.0.1:8000
+```
+
+Features:
+- **Chat with follow-ups** — the conversation is remembered, so you can ask
+  "and what about Q4?" naturally. "New chat" clears it.
+- **Streaming answers** — text appears token-by-token, rendered as markdown,
+  with **Stop** (cancel mid-answer), **Copy**, and **Regenerate** controls.
+- **Upload documents in-browser** — "+ Add documents" ingests files instantly
+  (no CLI needed); they're saved to `docs/` and indexed on the spot.
+- **Expandable sources** — each answer has a "Sources" toggle showing the exact
+  passages it drew from.
+
+`Enter` sends, `Shift+Enter` for a newline.
+
+Endpoints (also usable as a JSON API):
+
+| Route | Purpose |
+|-------|---------|
+| `GET /` | The chat page |
+| `GET /api/sources` | Indexed documents + active backend |
+| `POST /api/ask` | `{question, history?, top_k?}` → `{answer, backend, citations, sources}` (non-streaming) |
+| `POST /api/ask/stream` | Same body → Server-Sent Events: `{type:"delta",text}` … `{type:"done",citations,sources,backend}` |
+| `POST /api/upload` | multipart `files=@...` → ingests and returns updated sources |
+
+## Query — option C: MCP server (any MCP client)
+
+The server does **retrieval only** — no LLM, no API key. The connecting MCP
+client (e.g. Claude Desktop, or any MCP-capable app) does the answering.
+
+Run it directly to sanity-check:
+
+```bash
+python -m docreader.mcp_server
+```
+
+**Claude Desktop** — add to `claude_desktop_config.json`
+(`%APPDATA%\Claude\` on Windows, `~/Library/Application Support/Claude/` on macOS):
+
+```json
+{
+  "mcpServers": {
+    "doc-reader": {
+      "command": "C:\\Users\\j3166\\rag-mcp-doc-reader\\.venv\\Scripts\\python.exe",
+      "args": ["-m", "docreader.mcp_server"],
+      "cwd": "C:\\Users\\j3166\\rag-mcp-doc-reader",
+      "env": { "PYTHONPATH": "C:\\Users\\j3166\\rag-mcp-doc-reader\\src" }
+    }
+  }
+}
+```
+
+**Claude Code** — from the project directory:
+
+```bash
+claude mcp add doc-reader -- .venv/Scripts/python -m docreader.mcp_server
+```
+
+(Ensure `PYTHONPATH` includes `src/`, or install the package with `pip install -e .`.)
+
+Then ask the client a question — it will call `search_documents` and answer from
+your corpus. `list_sources` shows what's indexed.
+
+## Tools exposed over MCP
+
+| Tool | Purpose |
+|------|---------|
+| `search_documents(query, top_k)` | Return the most relevant passages with source + score |
+| `list_sources()` | List the document files currently indexed |
+
+## Configuration (`.env`)
+
+| Var | Default | Notes |
+|-----|---------|-------|
+| `ANSWER_BACKEND` | `extractive` | `gemini`, `extractive`, or `ollama` |
+| `GEMINI_API_KEY` | — | required for the `gemini` backend |
+| `GEMINI_MODEL` | `gemini-2.5-flash` | any Gemini model id |
+| `OLLAMA_URL` / `OLLAMA_MODEL` | `localhost:11434` / `llama3.2` | for the `ollama` backend |
+| `EMBEDDING_PROVIDER` | `local` | `local` (offline) or `voyage` (hosted) |
+| `EMBEDDING_MODEL` | `all-MiniLM-L6-v2` | or `voyage-3` when using Voyage |
+| `DB_PATH` | `./chroma_db` | on-disk vector store location |
+| `DOCS_DIR` | `./docs` | where your source files live |
+| `CHUNK_SIZE` / `CHUNK_OVERLAP` | `1000` / `150` | characters |
+| `RETRIEVAL_MODE` | `hybrid` | `hybrid` (vector + keyword) or `vector` |
+| `RERANK` | `true` | cross-encoder re-ranking of candidates (better answers) |
+| `RERANK_MODEL` | `cross-encoder/ms-marco-MiniLM-L-6-v2` | any CrossEncoder model |
+| `TOP_K` | `6` | chunks retrieved per query |
+
+### Switch to hosted embeddings (Voyage)
+
+1. `pip install voyageai`
+2. In `.env`: `EMBEDDING_PROVIDER=voyage`, `EMBEDDING_MODEL=voyage-3`, set `VOYAGE_API_KEY`
+3. Re-run `python -m docreader.ingest --reset` (embeddings must match at index + query time)
+
+## Deployment notes
+
+- Everything is self-contained: local embeddings + on-disk ChromaDB, no external
+  services. Ship the code, run `ingest`, and either run the MCP server as a
+  long-lived process or call `ask.py` from your app.
+- To scale beyond a single box, point `DB_PATH` at shared storage or migrate the
+  `Store` wrapper (`src/docreader/store.py`) to Chroma's client/server mode or a
+  hosted vector DB — the rest of the code is unaffected.
+
+## Project layout
+
+```
+src/docreader/
+  config.py       env-driven config
+  embeddings.py   local / Voyage provider (swappable)
+  chunking.py     recursive char chunker with overlap
+  store.py        ChromaDB persistent wrapper
+  ingest.py       parse -> chunk -> embed -> store (CLI)
+  retrieve.py     query -> top-k chunks (shared retrieval core)
+  answer.py       retrieve -> answer (gemini / extractive / ollama backends)
+  mcp_server.py   FastMCP server exposing the corpus (retrieval only)
+  ask.py          standalone RAG CLI (thin wrapper over answer.py)
+  web.py          FastAPI web UI + JSON API (over answer.py)
+```
